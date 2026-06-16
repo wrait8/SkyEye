@@ -1,5 +1,6 @@
 # SkyEye
 
+<img width="2281" height="501" alt="SkyEye" src="https://github.com/user-attachments/assets/9862899a-993c-4016-b5eb-869b58f76e83" />
 
 *A curses-based terminal application for viewing and analyzing satellite Two-Line Element (TLE) data*
 
