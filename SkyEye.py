@@ -1,181 +1,311 @@
+# skyeye.py
+"""
+SkyEye - A curses-based terminal application for viewing and analyzing satellite TLE data
+"""
+
 import curses
 import urllib.request
-from curses import wrapper
-import textwrap
-from modules import pretty_print, splitElem, checkValid  # Import needed functions
-import pytz
+from typing import List, Optional, Dict, Any
+from dataclasses import dataclass
+import ephem
 
-def fetch_tle_data():
-    url = "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle"
-    with urllib.request.urlopen(url) as response:
-        return response.read().decode('utf-8')
+# Import from modules
+from modules import (
+    check_valid, split_elem, checksum, 
+    calculate_orbital_elements, spinner,
+    PDT, PI, SIN, COS, SQRT, GM
+)
 
-def parse_tle_data(raw_data):
-    lines = raw_data.split('\n')
-    satellites = []
-    
-    i = 0
-    while i < len(lines) - 2:
-        if lines[i].strip() and lines[i+1].startswith('1 ') and lines[i+2].startswith('2 '):
-            name = lines[i].strip()
-            line1 = lines[i+1].strip()
-            line2 = lines[i+2].strip()
-            satellites.append((name, line1, line2))
-            i += 3
-        else:
-            i += 1
-    
-    return satellites
- 
-def display_banner(stdscr, y_offset=0):
-    banner = [
-        "  ___________           ___________             ",
-        " /   _____/  | _____.__.\\_   _____/__.__. ____  ",
-        " \\_____  \\|  |/ <   |  | |    __)<   |  |/ __ \\ ",
-        " /        \\    < \\___  | |        \\___  \\  ___/ ",
-        "/_______  /__|_ \\/ ____|/_______  / ____|\\___  >",
-        "        \\/     \\/\\/             \\/\\/         \\/ "
-    ]
-    
-    max_y, max_x = stdscr.getmaxyx()
-    start_y = y_offset
-    
-    for i, line in enumerate(banner):
-        if start_y + i < max_y - 1:
-            stdscr.addstr(start_y + i, (max_x - len(line)) // 2, line, curses.A_BOLD | curses.color_pair(4))
 
-def display_satellite(stdscr, satellite, show_basic=True):
-    stdscr.clear()
-    name, line1, line2 = satellite
-    
-    # Display banner at top
-    display_banner(stdscr)
-    
-    max_y, max_x = stdscr.getmaxyx()
-    current_line = 7  # Below banner
-    
-    if show_basic:
-        # Basic TLE display
-        if current_line < max_y - 1:
-            stdscr.addstr(current_line, 0, name, curses.A_BOLD)
-            current_line += 2
-        
-        if current_line < max_y - 1:
-            stdscr.addstr(current_line, 0, line1)
-            current_line += 1
-        
-        if current_line < max_y - 1:
-            stdscr.addstr(current_line, 0, line2)
-            current_line += 2
-        
-        if current_line < max_y - 1:
-            stdscr.addstr(current_line, 0, "Press 'd' for detailed view, any other key to return", curses.A_DIM)
-    else:
-        # Detailed TLE display
-        pretty_print(satellite, stdscr, current_line)
-        if max_y - 1 > current_line:
-            stdscr.addstr(max_y - 1, 0, "Press any key to return to list", curses.A_DIM)
-    
-    stdscr.refresh()
-    key = stdscr.getch()
-    
-    # Toggle between basic and detailed view
-    if show_basic and key == ord('d'):
-        display_satellite(stdscr, satellite, show_basic=False)
+# =============================================================================
+# Data Models
+# =============================================================================
 
-def main(stdscr):
-    # Initialize colors
-    curses.start_color()
-    curses.init_pair(1, curses.COLOR_RED, curses.COLOR_BLACK)
-    curses.init_pair(2, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-    curses.init_pair(3, curses.COLOR_GREEN, curses.COLOR_BLACK)
-    curses.init_pair(4, curses.COLOR_BLUE, curses.COLOR_BLACK)
+@dataclass
+class Satellite:
+    """Represents a satellite with its TLE data and orbital parameters"""
+    name: str
+    line1: str
+    line2: str
     
-    # Initialize curses
-    curses.curs_set(0)  # Hide cursor
-    stdscr.clear()
+    # Calculated parameters (lazy loaded)
+    _parameters: Optional[Dict[str, Any]] = None
     
-    # Display loading message with banner
-    display_banner(stdscr)
-    max_y, max_x = stdscr.getmaxyx()
-    if max_y > 7:
-        stdscr.addstr(7, 0, "[*] Fetching TLE data from Celestrak...", curses.A_BOLD | curses.color_pair(4))
-    stdscr.refresh()
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        """Get or calculate orbital parameters"""
+        if self._parameters is None:
+            self._parameters = calculate_orbital_elements((self.name, self.line1, self.line2))
+        return self._parameters
     
-    try:
-        # Fetch and parse data
-        raw_data = fetch_tle_data()
-        satellites = parse_tle_data(raw_data)
-    except Exception as e:
-        stdscr.clear()
-        display_banner(stdscr)
-        if max_y > 7:
-            stdscr.addstr(7, 0, f"Error fetching data: {str(e)}", curses.A_BOLD | curses.color_pair(1))
-            stdscr.addstr(9, 0, "Press any key to exit...")
-        stdscr.refresh()
-        stdscr.getch()
-        return
+    def is_valid(self) -> bool:
+        """Check if TLE data is valid"""
+        return check_valid((self.name, self.line1, self.line2))
     
-    # Main UI loop
-    current_selection = 0
-    while True:
-        stdscr.clear()
-        max_y, max_x = stdscr.getmaxyx()
+    def __str__(self) -> str:
+        return f"{self.name}\n{self.line1}\n{self.line2}"
+
+
+# =============================================================================
+# TLE Data Fetcher
+# =============================================================================
+
+class TLEFetcher:
+    """Fetches and parses TLE data from Celestrak"""
+    
+    TLE_URL = "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle"
+    
+    @classmethod
+    def fetch(cls) -> List[Satellite]:
+        """Fetch and parse TLE data from Celestrak"""
+        try:
+            with urllib.request.urlopen(cls.TLE_URL) as response:
+                raw_data = response.read().decode('utf-8')
+            return cls._parse(raw_data)
+        except Exception as e:
+            raise ConnectionError(f"Failed to fetch TLE data: {str(e)}")
+    
+    @staticmethod
+    def _parse(raw_data: str) -> List[Satellite]:
+        """Parse raw TLE data into Satellite objects"""
+        lines = raw_data.split('\n')
+        satellites = []
         
-        # Display banner
-        display_banner(stdscr)
+        i = 0
+        while i < len(lines) - 2:
+            if (lines[i].strip() and 
+                lines[i + 1].startswith('1 ') and 
+                lines[i + 2].startswith('2 ')):
+                
+                name = lines[i].strip()
+                line1 = lines[i + 1].strip()
+                line2 = lines[i + 2].strip()
+                
+                satellite = Satellite(name, line1, line2)
+                if satellite.is_valid():
+                    satellites.append(satellite)
+                i += 3
+            else:
+                i += 1
         
-        # Display header below banner
+        return satellites
+
+
+# =============================================================================
+# UI Components
+# =============================================================================
+
+class UI:
+    """Handles all UI rendering and interaction"""
+    
+    # Color pairs
+    COLOR_RED = 1
+    COLOR_YELLOW = 2
+    COLOR_GREEN = 3
+    COLOR_BLUE = 4
+    
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.max_y, self.max_x = stdscr.getmaxyx()
+        self._init_colors()
+        
+    def _init_colors(self):
+        """Initialize color pairs"""
+        curses.start_color()
+        curses.init_pair(self.COLOR_RED, curses.COLOR_RED, curses.COLOR_BLACK)
+        curses.init_pair(self.COLOR_YELLOW, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+        curses.init_pair(self.COLOR_GREEN, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        curses.init_pair(self.COLOR_BLUE, curses.COLOR_BLUE, curses.COLOR_BLACK)
+        curses.curs_set(0)  # Hide cursor
+        
+    def refresh_dimensions(self):
+        """Refresh screen dimensions"""
+        self.max_y, self.max_x = self.stdscr.getmaxyx()
+        
+    def clear(self):
+        """Clear the screen"""
+        self.stdscr.clear()
+        
+    def refresh(self):
+        """Refresh the screen"""
+        self.stdscr.refresh()
+        
+    def getch(self) -> int:
+        """Get a character from the user"""
+        return self.stdscr.getch()
+        
+    def add_text(self, y: int, x: int, text: str, attr: int = 0) -> bool:
+        """Safely add text to the screen"""
+        try:
+            if 0 <= y < self.max_y and 0 <= x < self.max_x:
+                text = text[:self.max_x - x]
+                self.stdscr.addstr(y, x, text, attr)
+                return True
+        except curses.error:
+            pass
+        return False
+    
+    def display_banner(self, y_offset: int = 0):
+        """Display the SkyEye banner"""
+        banner = [
+            "  ___________           ___________             ",
+            " /   _____/  | _____.__.\\_   _____/__.__. ____  ",
+            " \\_____  \\|  |/ <   |  | |    __)<   |  |/ __ \\ ",
+            " /        \\    < \\___  | |        \\___  \\  ___/ ",
+            "/_______  /__|_ \\/ ____|/_______  / ____|\\___  >",
+            "        \\/     \\/\\/             \\/\\/         \\/ "
+        ]
+        
+        start_y = y_offset
+        for i, line in enumerate(banner):
+            if start_y + i < self.max_y - 1:
+                x = (self.max_x - len(line)) // 2
+                self.add_text(start_y + i, x, line, 
+                            curses.A_BOLD | curses.color_pair(self.COLOR_BLUE))
+    
+    def display_loading(self, message: str = "Loading...", y_offset: int = 7):
+        """Display a loading message with spinner"""
+        self.add_text(y_offset, 0, f"⏳ {message}", 
+                     curses.A_BOLD | curses.color_pair(self.COLOR_BLUE))
+        self.refresh()
+
+
+# =============================================================================
+# Application
+# =============================================================================
+
+class SkyEyeApp:
+    """Main application class"""
+    
+    def __init__(self, stdscr):
+        self.ui = UI(stdscr)
+        self.satellites: List[Satellite] = []
+        self.current_selection: int = 0
+        
+    def run(self):
+        """Run the main application loop"""
+        self.ui.clear()
+        self.ui.display_banner()
+        
+        # Fetch TLE data
+        self.ui.display_loading("Fetching TLE data from Celestrak...")
+        
+        try:
+            self.satellites = TLEFetcher.fetch()
+        except Exception as e:
+            self.ui.clear()
+            self.ui.display_banner()
+            self.ui.add_text(7, 0, f"Error: {str(e)}", 
+                           curses.A_BOLD | curses.color_pair(self.ui.COLOR_RED))
+            self.ui.add_text(9, 0, "Press any key to exit...")
+            self.ui.refresh()
+            self.ui.getch()
+            return
+        
+        # Main loop
+        while True:
+            self._display_list()
+            key = self.ui.getch()
+            
+            if not self._handle_key(key):
+                break
+    
+    def _display_list(self):
+        """Display the satellite list"""
+        self.ui.clear()
+        self.ui.display_banner()
+        
+        self.ui.refresh_dimensions()
+        max_y, max_x = self.ui.max_y, self.ui.max_x
+        
+        # Header
         if max_y > 7:
             header = "Active Satellite TLE Data (↑/↓ to navigate, ENTER to select, q to quit)"
-            stdscr.addstr(7, 0, header[:max_x-1], curses.A_BOLD)
-            stdscr.addstr(8, 0, "-" * (max_x-1))
+            self.ui.add_text(7, 0, header[:max_x - 1], curses.A_BOLD)
+            self.ui.add_text(8, 0, "-" * (max_x - 1))
         
-        # Calculate how many items we can display
+        # Calculate visible range
         items_start_y = 9
-        items_per_page = max_y - items_start_y - 2  # Leave space for footer
-        start_index = max(0, current_selection - items_per_page // 2)
-        end_index = min(len(satellites), start_index + items_per_page)
+        items_per_page = max_y - items_start_y - 2
+        start_index = max(0, self.current_selection - items_per_page // 2)
+        end_index = min(len(self.satellites), start_index + items_per_page)
         
-        # Display satellite list
+        # Display satellites
         for i in range(start_index, end_index):
             y_pos = items_start_y + (i - start_index)
             if y_pos >= max_y - 1:
                 continue
-                
-            name = satellites[i][0]
             
-            # Highlight current selection
-            if i == current_selection:
-                stdscr.addstr(y_pos, 0, "> " + name[:max_x-3], curses.A_REVERSE)
+            name = self.satellites[i].name
+            if i == self.current_selection:
+                self.ui.add_text(y_pos, 0, f"> {name[:max_x - 3]}", curses.A_REVERSE)
             else:
-                stdscr.addstr(y_pos, 0, "  " + name[:max_x-3])
+                self.ui.add_text(y_pos, 0, f"  {name[:max_x - 3]}")
         
-        # Display footer info
+        # Footer
         if max_y > 1:
-            footer = f"Showing {start_index+1}-{end_index} of {len(satellites)} satellites"
-            stdscr.addstr(max_y-1, 0, footer[:max_x-1], curses.A_DIM)
+            footer = f"Showing {start_index + 1}-{end_index} of {len(self.satellites)} satellites"
+            self.ui.add_text(max_y - 1, 0, footer[:max_x - 1], curses.A_DIM)
         
-        # Get user input
-        key = stdscr.getch()
+        self.ui.refresh()
+    
+    def _handle_key(self, key: int) -> bool:
+        """Handle keyboard input, return False to exit"""
+        items_per_page = self.ui.max_y - 9 - 2
         
-        # Handle navigation
-        if key == curses.KEY_UP and current_selection > 0:
-            current_selection -= 1
-        elif key == curses.KEY_DOWN and current_selection < len(satellites) - 1:
-            current_selection += 1
-        elif key == curses.KEY_ENTER or key in [10, 13]:  # Enter key
-            display_satellite(stdscr, satellites[current_selection])
+        if key == curses.KEY_UP and self.current_selection > 0:
+            self.current_selection -= 1
+        elif key == curses.KEY_DOWN and self.current_selection < len(self.satellites) - 1:
+            self.current_selection += 1
+        elif key in [curses.KEY_ENTER, 10, 13]:  # Enter
+            self._display_satellite_detail(self.satellites[self.current_selection])
         elif key == ord('q'):
-            break
+            return False
         elif key == curses.KEY_HOME:
-            current_selection = 0
+            self.current_selection = 0
         elif key == curses.KEY_END:
-            current_selection = len(satellites) - 1
-        elif key == curses.KEY_PPAGE:  # Page up
-            current_selection = max(0, current_selection - items_per_page)
-        elif key == curses.KEY_NPAGE:  # Page down
-            current_selection = min(len(satellites) - 1, current_selection + items_per_page)
+            self.current_selection = len(self.satellites) - 1
+        elif key == curses.KEY_PPAGE:
+            self.current_selection = max(0, self.current_selection - items_per_page)
+        elif key == curses.KEY_NPAGE:
+            self.current_selection = min(len(self.satellites) - 1, 
+                                        self.current_selection + items_per_page)
+        return True
+    
+    def _display_satellite_detail(self, satellite: Satellite):
+        """Display detailed satellite information"""
+        self.ui.clear()
+        self.ui.display_banner()
+        
+        self.ui.refresh_dimensions()
+        current_line = 7
+        
+        # Use the calculate_orbital_elements function from modules
+        calculate_orbital_elements(
+            (satellite.name, satellite.line1, satellite.line2),
+            self.ui.stdscr,
+            current_line
+        )
+
+
+# =============================================================================
+# Entry Point
+# =============================================================================
+
+def main(stdscr):
+    """Main entry point for curses wrapper"""
+    app = SkyEyeApp(stdscr)
+    app.run()
+
 
 if __name__ == "__main__":
-    wrapper(main)
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        print("\nExiting SkyEye...")
+        import sys
+        sys.exit(0)
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        import sys
+        sys.exit(1)
