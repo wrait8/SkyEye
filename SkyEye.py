@@ -9,11 +9,11 @@ from typing import List, Optional, Dict, Any
 from dataclasses import dataclass
 import ephem
 
-# Import from modules
-from modules import (
-    check_valid, split_elem, checksum, 
-    calculate_orbital_elements, spinner,
-    PDT, PI, SIN, COS, SQRT, GM
+# Import from Modules package
+from Modules import (
+    check_valid,
+    calculate_orbital_elements,
+    spinner
 )
 
 
@@ -280,7 +280,7 @@ class SkyEyeApp:
         self.ui.refresh_dimensions()
         current_line = 7
         
-        # Use the calculate_orbital_elements function from modules
+        # Use the calculate_orbital_elements function from Modules
         calculate_orbital_elements(
             (satellite.name, satellite.line1, satellite.line2),
             self.ui.stdscr,
